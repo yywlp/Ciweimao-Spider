@@ -1,4 +1,4 @@
-"""Offline OCR for Ciweimao image chapters using RapidOCR (ONNX Runtime)."""
+"""Offline OCR for Ciweimao image chapters using RapidOCR (PP-OCRv5 Server / Mobile)."""
 
 import argparse
 import io
@@ -10,48 +10,79 @@ import numpy as np
 from PIL import Image
 
 from exporter import ContentError, book_id, export_txt, write_json
+from proofread import apply_proofread, load_replacements
 
 
 ROOT = Path(__file__).resolve().parent
-_ENGINE = None
+OCR_CACHE_VERSION = 2
+_ENGINES = {}
 
 
-def get_engine():
-    global _ENGINE
-    if _ENGINE is None:
-        try:
-            from rapidocr_onnxruntime import RapidOCR
-        except ImportError:
-            raise ContentError(
-                "缺少 OCR 依赖 rapidocr-onnxruntime，请先执行：python -m pip install -r requirements.txt"
-            ) from None
-        _ENGINE = RapidOCR()
-    return _ENGINE
+def engine_tag_for(mode="accurate", backend="rapidocr"):
+    mode = mode if mode in ("accurate", "fast") else "accurate"
+    if backend == "rapidocr":
+        return "ppocrv5_server_v2" if mode == "accurate" else "ppocrv5_mobile_v2"
+    return "ppocrv4_mobile_legacy_v2"
+
+
+def get_engine(mode="accurate"):
+    """Return (engine, engine_tag) for the requested OCR quality mode."""
+    mode = mode if mode in ("accurate", "fast") else "accurate"
+    if mode in _ENGINES:
+        return _ENGINES[mode]
+    try:
+        from rapidocr import EngineType, ModelType, OCRVersion, RapidOCR
+
+        rec_type = ModelType.SERVER if mode == "accurate" else ModelType.MOBILE
+        engine = RapidOCR(
+            params={
+                "Det.engine_type": EngineType.ONNXRUNTIME,
+                "Det.model_type": ModelType.MOBILE,
+                "Det.ocr_version": OCRVersion.PPOCRV5,
+                "Rec.engine_type": EngineType.ONNXRUNTIME,
+                "Rec.model_type": rec_type,
+                "Rec.ocr_version": OCRVersion.PPOCRV5,
+            }
+        )
+        pair = (engine, engine_tag_for(mode, "rapidocr"))
+        _ENGINES[mode] = pair
+        return pair
+    except ImportError:
+        pass
+
+    try:
+        from rapidocr_onnxruntime import RapidOCR as LegacyRapidOCR
+
+        engine = LegacyRapidOCR()
+        pair = (engine, engine_tag_for(mode, "legacy"))
+        _ENGINES[mode] = pair
+        return pair
+    except ImportError:
+        raise ContentError(
+            "缺少 OCR 依赖 rapidocr，请先执行：python -m pip install -r requirements.txt"
+        ) from None
 
 
 def preprocess_image(image):
-    """Remove faint background/inline watermarks and normalize dark text onto white."""
+    """Gently remove faint watermarks while preserving anti-aliased strokes of small text."""
     gray = np.array(image.convert("L"), dtype=np.uint8)
     bg = float(np.median(gray))
     if bg < 128.0:
         gray = (255 - gray).astype(np.uint8)
         bg = 255.0 - bg
-    # Ciweimao watermarks sit near bg-20..bg-50, while real text is much darker.
-    cutoff = max(120.0, bg - 60.0)
+    # Watermarks sit near bg-20..bg-50; keep strokes < cutoff intact and slightly darkened.
+    cutoff = max(130.0, bg - 52.0)
     mask = gray < cutoff
     if not np.any(mask):
         return np.full_like(gray, 255)
-    dark = float(np.percentile(gray[mask], 5))
-    span = max(1.0, cutoff - dark)
-    stretched = (gray.astype(np.float32) - dark) * (255.0 / span)
-    cleaned = np.clip(stretched, 0, 255).astype(np.uint8)
-    cleaned[~mask] = 255
+    cleaned = np.full_like(gray, 255)
+    cleaned[mask] = np.clip(gray[mask].astype(np.int32) - 40, 0, 255).astype(np.uint8)
     return cleaned
 
 
 def split_into_chunks(gray, max_height=900, pad=16):
     """Split a tall grayscale image on blank horizontal rows so no line is cut."""
-    height, width = gray.shape
+    height, _width = gray.shape
     if height <= max_height:
         padded = np.pad(gray, ((pad, pad), (0, 0)), mode="constant", constant_values=255)
         return [(0, pad, padded)]
@@ -61,7 +92,6 @@ def split_into_chunks(gray, max_height=900, pad=16):
     while start < height:
         end = min(height, start + max_height)
         if end < height:
-            # Walk backward from `end` to find a blank row between lines.
             cut = end
             min_cut = start + max(100, max_height // 3)
             while cut > min_cut and not blank[cut]:
@@ -75,12 +105,28 @@ def split_into_chunks(gray, max_height=900, pad=16):
     return chunks
 
 
+def _extract_ocr_boxes(raw_output):
+    if hasattr(raw_output, "boxes") and hasattr(raw_output, "txts"):
+        if raw_output.boxes is None or not raw_output.txts:
+            return []
+        return [(pts, text) for pts, text in zip(raw_output.boxes, raw_output.txts) if text]
+    if isinstance(raw_output, tuple) and raw_output:
+        result = raw_output[0]
+        if not result:
+            return []
+        return [(entry[0], entry[1]) for entry in result if len(entry) >= 2 and entry[1]]
+    return []
+
+
 def merge_lines_to_paragraphs(boxes):
     """Reconstruct Chinese novel paragraphs from OCR bounding boxes (x1, y1, x2, y2, text)."""
-    items = [(float(x1), float(y1), float(x2), float(y2), text.strip()) for x1, y1, x2, y2, text in boxes if text and text.strip()]
+    items = [
+        (float(x1), float(y1), float(x2), float(y2), text.strip())
+        for x1, y1, x2, y2, text in boxes
+        if text and text.strip()
+    ]
     if not items:
         return []
-    # Sort top-to-bottom first, then group boxes belonging to the same visual line.
     items.sort(key=lambda b: ((b[1] + b[3]) / 2.0, b[0]))
     lines = []
     for box in items:
@@ -129,7 +175,7 @@ def merge_lines_to_paragraphs(boxes):
     return paragraphs
 
 
-def recognize_image(source, engine=None):
+def recognize_image(source, engine=None, mode="accurate"):
     """Run offline OCR on a chapter image (Path, str, bytes, or PIL.Image)."""
     if isinstance(source, Image.Image):
         image = source
@@ -143,19 +189,15 @@ def recognize_image(source, engine=None):
         if not isinstance(source, Image.Image):
             image.close()
 
-    ocr_engine = engine or get_engine()
+    ocr_engine = engine if engine is not None else get_engine(mode)[0]
     all_boxes = []
     for y_offset, pad, chunk_gray in split_into_chunks(cleaned):
         if chunk_gray.min() >= 250:
             continue
         rgb = np.stack([chunk_gray, chunk_gray, chunk_gray], axis=-1)
-        result, _ = ocr_engine(rgb)
-        if not result:
-            continue
-        for entry in result:
-            pts, text = entry[0], entry[1]
-            xs = [p[0] for p in pts]
-            ys = [p[1] - pad + y_offset for p in pts]
+        for pts, text in _extract_ocr_boxes(ocr_engine(rgb)):
+            xs = [float(p[0]) for p in pts]
+            ys = [float(p[1]) - pad + y_offset for p in pts]
             all_boxes.append((min(xs), min(ys), max(xs), max(ys), text))
     paragraphs = merge_lines_to_paragraphs(all_boxes)
     if not paragraphs:
@@ -163,44 +205,53 @@ def recognize_image(source, engine=None):
     return paragraphs
 
 
-def cached_ocr(folder, identifier, image_sha256):
+def cached_ocr(folder, identifier, image_sha256, engine_tag=None):
     try:
         record = json.loads((Path(folder) / f"{identifier}.ocr.json").read_text(encoding="utf-8"))
-        if (record.get("version") == 1
-                and record.get("id") == identifier
-                and record.get("image_sha256") == image_sha256
-                and isinstance(record.get("paragraphs"), list)
-                and any(isinstance(p, str) and p.strip() for p in record["paragraphs"])):
+        if (
+            record.get("version") == OCR_CACHE_VERSION
+            and record.get("id") == identifier
+            and record.get("image_sha256") == image_sha256
+            and (engine_tag is None or record.get("engine_tag") == engine_tag)
+            and isinstance(record.get("paragraphs"), list)
+            and any(isinstance(p, str) and p.strip() for p in record["paragraphs"])
+        ):
             return record["paragraphs"]
     except (OSError, ValueError, KeyError, TypeError):
         pass
     return None
 
 
-def save_ocr(folder, identifier, image_sha256, paragraphs):
+def save_ocr(folder, identifier, image_sha256, paragraphs, engine_tag="ppocrv5_server_v2"):
     record = {
-        "version": 1,
+        "version": OCR_CACHE_VERSION,
         "id": identifier,
         "image_sha256": image_sha256,
+        "engine_tag": engine_tag,
         "paragraphs": paragraphs,
     }
     write_json(Path(folder) / f"{identifier}.ocr.json", record)
     return record
 
 
-def chapter_paragraphs(folder, record, engine=None, progress=None):
-    """Return paragraphs for a cached text or image chapter (with OCR caching)."""
+def chapter_paragraphs(folder, record, engine=None, engine_tag=None, mode="accurate", force=False, progress=None):
+    """Return paragraphs for a cached text or image chapter (with model-aware OCR caching)."""
     if record["kind"] == "text":
         return record["paragraphs"]
     identifier = record["id"]
     sha = record["sha256"]
-    cached = cached_ocr(folder, identifier, sha)
-    if cached is not None:
-        return cached
+    if not force:
+        cached = cached_ocr(folder, identifier, sha, engine_tag=engine_tag)
+        if cached is not None:
+            return cached
     if progress:
         progress(record)
-    paragraphs = recognize_image(Path(folder) / f"{identifier}.png", engine=engine)
-    save_ocr(folder, identifier, sha, paragraphs)
+    if engine is None:
+        engine, engine_tag = get_engine(mode)
+    elif engine_tag is None:
+        engine_tag = engine_tag_for(mode)
+    paragraphs = recognize_image(Path(folder) / f"{identifier}.png", engine=engine, mode=mode)
+    save_ocr(folder, identifier, sha, paragraphs, engine_tag=engine_tag)
     return paragraphs
 
 
@@ -219,12 +270,37 @@ def resolve_book_dir(target, output_root):
     raise ContentError(f"未找到书籍目录或 catalog.json：{target}")
 
 
+def make_ocr_runner(mode="accurate", force=False):
+    engine = None
+    tag = None
+
+    def ocr_fn(ch_folder, record):
+        nonlocal engine, tag
+        if record["kind"] == "image":
+            # Peek cache before initializing the heavy OCR model if we can match expected tag.
+            expected_tag = tag or engine_tag_for(mode, "rapidocr")
+            if not force and cached_ocr(ch_folder, record["id"], record["sha256"], engine_tag=expected_tag) is not None:
+                return cached_ocr(ch_folder, record["id"], record["sha256"], engine_tag=expected_tag)
+            if engine is None:
+                label = "高精度 PP-OCRv5 Server" if mode == "accurate" else "快速 Mobile"
+                print(f"正在初始化本地 OCR 引擎（{label}）...", flush=True)
+                engine, tag = get_engine(mode)
+            if force or cached_ocr(ch_folder, record["id"], record["sha256"], engine_tag=tag) is None:
+                print(f"正在 OCR 识别：{record['title']}", flush=True)
+        return chapter_paragraphs(ch_folder, record, engine=engine, engine_tag=tag, mode=mode, force=force)
+
+    return ocr_fn
+
+
 def main():
-    parser = argparse.ArgumentParser(description="将已下载的刺猬猫书籍（含图片章节自动 OCR）导出为 TXT。")
+    parser = argparse.ArgumentParser(description="将已下载的刺猬猫书籍（含图片章节自动 OCR 与词表校对）导出为 TXT。")
     parser.add_argument("target", nargs="?", help="书籍 ID、书籍链接，或 output\\书籍ID 目录路径")
     parser.add_argument("--start", type=int, default=1, help="从目录第几项开始（默认 1）")
     parser.add_argument("--limit", type=int, help="最多导出几章")
     parser.add_argument("--output", type=Path, default=ROOT / "output", help="默认输出根目录")
+    parser.add_argument("--ocr-mode", choices=("accurate", "fast"), default="accurate", help="OCR 精度档位（默认 accurate=PP-OCRv5 Server）")
+    parser.add_argument("--re-ocr", action="store_true", help="忽略已有 OCR 缓存，强制重新识别所有图片章节")
+    parser.add_argument("--replacements", type=Path, help="额外指定的纠错词表 JSON 路径")
     args = parser.parse_args()
     if args.start < 1 or (args.limit is not None and args.limit < 1):
         parser.error("start 和 limit 必须为正整数。")
@@ -244,18 +320,12 @@ def main():
         failures_path = dest_dir / "failures.json"
         failures = json.loads(failures_path.read_text(encoding="utf-8")) if failures_path.exists() else {}
         folder = book_dir / "chapters"
-        engine = None
-
-        def ocr_fn(ch_folder, record):
-            nonlocal engine
-            if record["kind"] == "image" and cached_ocr(ch_folder, record["id"], record["sha256"]) is None:
-                if engine is None:
-                    print("正在初始化本地 OCR 引擎（RapidOCR）...", flush=True)
-                    engine = get_engine()
-                print(f"正在 OCR 识别：{record['title']}", flush=True)
-            return chapter_paragraphs(ch_folder, record, engine=engine)
-
-        path, missing = export_txt(book, chapters, folder, dest_dir, failures, ocr_fn=ocr_fn)
+        replacements = load_replacements(book_dir, args.replacements)
+        if replacements:
+            print(f"已加载纠错词表：{len(replacements)} 条替换规则。", flush=True)
+        ocr_fn = make_ocr_runner(mode=args.ocr_mode, force=args.re_ocr)
+        proofread_fn = lambda paras: apply_proofread(paras, replacements=replacements, normalize_punct=True)
+        path, missing = export_txt(book, chapters, folder, dest_dir, failures, ocr_fn=ocr_fn, proofread_fn=proofread_fn)
         print(f"TXT：{path}\n成功 {len(chapters) - missing} 章；缺失 {missing} 章。", flush=True)
         return 2 if missing else 0
     except (KeyboardInterrupt, EOFError):

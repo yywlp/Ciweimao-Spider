@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+from contextlib import asynccontextmanager
 import time
 from urllib.parse import parse_qs, urlsplit
 
@@ -54,6 +55,62 @@ SNAPSHOT = r"""() => {
 
 async def logged_in(page):
     return await page.evaluate("() => Number(window.HB?.userinfo?.reader_id || 0) > 0")
+
+
+def normalize_font_size(font_size):
+    """Validate and clamp Ciweimao reader font_size (even integer in 12..48, or 0 to disable)."""
+    if not font_size:
+        return 0
+    try:
+        value = int(font_size)
+    except (TypeError, ValueError):
+        raise ContentError("字号必须为 12 到 48 之间的整数。") from None
+    if value < 12 or value > 48:
+        raise ContentError("字号必须在 12 到 48 之间。")
+    return value - (value % 2)
+
+
+def build_theme_cookie(existing, font_size):
+    """Update index 2 (fontSize) of Ciweimao's bookReadTheme cookie without altering other prefs."""
+    size = normalize_font_size(font_size)
+    parts = existing.split(",") if existing else ["default", "0", str(size), "0", "0", "0"]
+    while len(parts) < 6:
+        parts.append("0")
+    parts[2] = str(size)
+    return ",".join(parts)
+
+
+@asynccontextmanager
+async def apply_reader_font_size(context, font_size):
+    """Temporarily override local bookReadTheme cookie fontSize and restore it on exit."""
+    size = normalize_font_size(font_size)
+    if not size:
+        yield
+        return
+    cookies = await context.cookies("https://www.ciweimao.com")
+    original = next((c for c in cookies if c.get("name") == "bookReadTheme"), None)
+    new_value = build_theme_cookie(original.get("value") if original else None, size)
+    await context.add_cookies([{
+        "name": "bookReadTheme",
+        "value": new_value,
+        "domain": original["domain"] if original and original.get("domain") else "www.ciweimao.com",
+        "path": original["path"] if original and original.get("path") else "/",
+    }])
+    try:
+        yield
+    finally:
+        try:
+            if original is not None:
+                await context.add_cookies([{
+                    "name": "bookReadTheme",
+                    "value": original["value"],
+                    "domain": original.get("domain") or "www.ciweimao.com",
+                    "path": original.get("path") or "/",
+                }])
+            else:
+                await context.clear_cookies(name="bookReadTheme")
+        except Exception:
+            pass
 
 
 async def discover(page, url):

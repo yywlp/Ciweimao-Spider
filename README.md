@@ -11,9 +11,10 @@
   - 文字章节直接提取实时渲染 DOM，自动过滤 `opacity` 隐藏/淡化水印、吐槽计数与评论区节点。
   - 图片章节优先拦截浏览器原始图片响应（失败时使用 canvas 缓存兜底），保留完整原始 PNG，并在导出 EPUB 时自动切片适配阅读器。
 - **本地离线 OCR 转 TXT**：
-  - 基于 `rapidocr-onnxruntime`，完全本机运行，无需联网 API 或 GPU。
-  - 自动根据背景亮度去除斜向水印与行尾水印（兼容浅色/深色主题）。
-  - 按空白行切分长图，避免截断文字，并根据首行缩进与行距自动合并自然段。
+  - 基于 `rapidocr` v3（ONNX Runtime），支持 **高精度（PP-OCRv5 Server）** 与 **快速（Mobile）** 双档位，完全本机运行。
+  - **大字号高清抓图**：抓取图片章节时可临时通过本地 `bookReadTheme` Cookie 将阅读字号调大至 `28px` / `32px`（结束后自动恢复原设置），大幅提升复杂汉字识别率。
+  - 温和去水印（兼容浅色/深色主题）+ 空白行切图 + 首行缩进自动合并自然段。
+  - **后处理纠错词表**：支持全局 `ocr_replacements.json` 与单书 `output/<书籍ID>/replacements.json` 精准替换高频专有名词，并自动规整孤立英文省略号。
 - **断点续传与缓存校验**：
   - 章节正文、图片及 OCR 结果均独立缓存并做 SHA-256 校验，中断后重跑自动复用已完成章节。
   - 缺章不会静默丢弃，会在文件名标记 `-未完整` 并在正文内保留占位提示。
@@ -59,8 +60,11 @@ python gui.py
 # 首次运行（会打开 Edge 等待手动登录，登录后按回车开始）
 python main.py https://www.ciweimao.com/book/书籍ID
 
-# 已有本机登录态时，下载整本并导出 TXT（推荐单标签页更稳定）
-python main.py https://www.ciweimao.com/book/书籍ID --no-prompt --workers 1 --txt-only
+# 已有本机登录态时，以 28px 高清大字号下载整本并用高精度 PP-OCRv5 Server 导出 TXT
+python main.py https://www.ciweimao.com/book/书籍ID --no-prompt --workers 1 --font-size 28 --txt-only
+
+# 调大字号后仅重抓已缓存的付费图片章节（文字章节复用缓存）
+python main.py https://www.ciweimao.com/book/书籍ID --no-prompt --workers 1 --font-size 28 --force-redownload-images --txt-only
 
 # 同时导出 EPUB 和 TXT，只试跑前 3 章
 python main.py https://www.ciweimao.com/book/书籍ID --no-prompt --workers 1 --limit 3 --txt
@@ -68,8 +72,11 @@ python main.py https://www.ciweimao.com/book/书籍ID --no-prompt --workers 1 --
 # 指定从目录第 10 项起导出 5 章，后台无头运行
 python main.py https://www.ciweimao.com/book/书籍ID --start 10 --limit 5 --no-prompt --headless --txt
 
-# 对已下载到本地的书籍离线 OCR 转 TXT（也可双击 导出TXT.cmd）
-python ocr.py 书籍ID
+# 对已下载到本地的书籍离线高精度 OCR 转 TXT（也可双击 导出TXT.cmd）
+python ocr.py 书籍ID --ocr-mode accurate
+
+# 强制用新模型重新识别本地已有图片，或修改 replacements.json 后秒级重建 TXT
+python ocr.py 书籍ID --re-ocr
 ```
 
 ## 输出目录结构

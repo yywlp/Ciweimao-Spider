@@ -9,7 +9,9 @@ import threading
 
 import customtkinter as ctk
 
+from browser import normalize_font_size
 from exporter import ContentError, book_id
+from proofread import ensure_book_replacements_file
 
 
 ROOT = Path(__file__).resolve().parent
@@ -21,6 +23,18 @@ MODES = [
     ("epub_only", "仅下载并导出 EPUB"),
     ("offline_ocr", "仅离线 OCR 转 TXT（不打开浏览器，转已下载书籍）"),
 ]
+
+FONT_SIZE_CHOICES = {
+    "28px（推荐 OCR）": 28,
+    "32px（超大高清）": 32,
+    "24px": 24,
+    "不修改（原设置）": 0,
+}
+
+OCR_MODE_CHOICES = {
+    "高精度（PP-OCRv5 Server）": "accurate",
+    "快速（Mobile）": "fast",
+}
 
 
 def normalize_target(raw_text, offline_ocr=False):
@@ -71,16 +85,24 @@ def build_command(
     delay=2.0,
     no_prompt=True,
     headless=False,
+    font_size=28,
+    ocr_mode="accurate",
+    force_redownload_images=False,
+    re_ocr=False,
 ):
     offline = mode == "offline_ocr"
     normalized = normalize_target(target, offline_ocr=offline)
     start, limit = parse_chapter_range(all_chapters, start_text, end_text)
+    if ocr_mode not in ("accurate", "fast"):
+        raise ContentError("OCR 精度档位无效。")
     if offline:
-        cmd = [str(python_exe), str(ROOT / "ocr.py"), normalized]
+        cmd = [str(python_exe), str(ROOT / "ocr.py"), normalized, "--ocr-mode", ocr_mode]
         if start > 1:
             cmd += ["--start", str(start)]
         if limit is not None:
             cmd += ["--limit", str(limit)]
+        if re_ocr:
+            cmd.append("--re-ocr")
         return cmd
 
     try:
@@ -94,6 +116,7 @@ def build_command(
         raise ContentError("抓取间隔至少为 1 秒。")
     if headless and not no_prompt:
         raise ContentError("后台无头运行需要先勾选“已有登录状态，跳过手动登录确认”。")
+    size = normalize_font_size(font_size)
 
     cmd = [
         str(python_exe),
@@ -104,6 +127,10 @@ def build_command(
         "--delay",
         str(delay_val),
     ]
+    if size:
+        cmd += ["--font-size", str(size)]
+    if force_redownload_images:
+        cmd.append("--force-redownload-images")
     if start > 1:
         cmd += ["--start", str(start)]
     if limit is not None:
@@ -113,9 +140,13 @@ def build_command(
     if headless:
         cmd.append("--headless")
     if mode == "both":
-        cmd.append("--txt")
+        cmd += ["--txt", "--ocr-mode", ocr_mode]
+        if re_ocr:
+            cmd.append("--re-ocr")
     elif mode == "txt_only":
-        cmd.append("--txt-only")
+        cmd += ["--txt-only", "--ocr-mode", ocr_mode]
+        if re_ocr:
+            cmd.append("--re-ocr")
     return cmd
 
 
@@ -125,9 +156,9 @@ class CiweimaoApp(ctk.CTk):
         ctk.set_appearance_mode("System")
         ctk.set_default_color_theme("blue")
 
-        self.title("刺猬猫小说导出工具（EPUB / TXT + 本地 OCR）")
-        self.geometry("820x720")
-        self.minsize(740, 640)
+        self.title("刺猬猫小说导出工具（EPUB / TXT + 高精度本地 OCR）")
+        self.geometry("860x780")
+        self.minsize(780, 680)
 
         self.process = None
         self.log_queue = queue.Queue()
@@ -136,8 +167,12 @@ class CiweimaoApp(ctk.CTk):
         self.range_var = ctk.StringVar(value="all")
         self.workers_var = ctk.StringVar(value="1")
         self.delay_var = ctk.StringVar(value="2")
+        self.font_size_var = ctk.StringVar(value="28px（推荐 OCR）")
+        self.ocr_mode_var = ctk.StringVar(value="高精度（PP-OCRv5 Server）")
         self.no_prompt_var = ctk.BooleanVar(value=True)
         self.headless_var = ctk.BooleanVar(value=False)
+        self.force_redownload_var = ctk.BooleanVar(value=False)
+        self.re_ocr_var = ctk.BooleanVar(value=False)
 
         self._build_ui()
         self._update_controls()
@@ -165,11 +200,21 @@ class CiweimaoApp(ctk.CTk):
 
         ctk.CTkButton(
             book_frame,
+            text="编辑纠错词表",
+            width=106,
+            font=("Microsoft YaHei UI", 12),
+            fg_color="gray40",
+            hover_color="gray30",
+            command=self._edit_replacements,
+        ).grid(row=0, column=2, padx=(0, 8), pady=12)
+
+        ctk.CTkButton(
+            book_frame,
             text="打开输出目录",
-            width=110,
+            width=106,
             font=("Microsoft YaHei UI", 12),
             command=self._open_output,
-        ).grid(row=0, column=2, padx=(0, 12), pady=12)
+        ).grid(row=0, column=3, padx=(0, 12), pady=12)
 
         # 2. Mode selection
         mode_frame = ctk.CTkFrame(self)
@@ -187,10 +232,10 @@ class CiweimaoApp(ctk.CTk):
                 variable=self.mode_var,
                 value=value,
                 font=("Microsoft YaHei UI", 12),
-                command=self._update_controls,
+                command=self._on_mode_change,
             ).grid(row=r + 1, column=c, padx=14, pady=6, sticky="w")
 
-        # 3. Chapter range + crawl options
+        # 3. Chapter range + crawl + OCR options
         opt_frame = ctk.CTkFrame(self)
         opt_frame.grid(row=2, column=0, padx=16, pady=6, sticky="ew")
         opt_frame.grid_columnconfigure(0, weight=1)
@@ -217,29 +262,64 @@ class CiweimaoApp(ctk.CTk):
         ctk.CTkLabel(range_row, text="章（按目录序号）", font=("Microsoft YaHei UI", 12)).pack(side="left")
 
         crawl_row = ctk.CTkFrame(opt_frame, fg_color="transparent")
-        crawl_row.grid(row=1, column=0, padx=10, pady=(2, 10), sticky="ew")
+        crawl_row.grid(row=1, column=0, padx=10, pady=(2, 6), sticky="ew")
 
         ctk.CTkLabel(crawl_row, text="抓取设置：", font=("Microsoft YaHei UI", 13, "bold")).pack(side="left", padx=(2, 8))
-        ctk.CTkLabel(crawl_row, text="并发标签页", font=("Microsoft YaHei UI", 12)).pack(side="left")
+        ctk.CTkLabel(crawl_row, text="并发", font=("Microsoft YaHei UI", 12)).pack(side="left")
         self.workers_menu = ctk.CTkOptionMenu(
-            crawl_row, values=["1", "2", "3", "4"], variable=self.workers_var, width=64, font=("Microsoft YaHei UI", 12)
+            crawl_row, values=["1", "2", "3", "4"], variable=self.workers_var, width=58, font=("Microsoft YaHei UI", 12)
         )
-        self.workers_menu.pack(side="left", padx=(4, 12))
+        self.workers_menu.pack(side="left", padx=(4, 10))
 
         ctk.CTkLabel(crawl_row, text="间隔(秒)", font=("Microsoft YaHei UI", 12)).pack(side="left")
-        self.delay_entry = ctk.CTkEntry(crawl_row, width=56, textvariable=self.delay_var, font=("Microsoft YaHei UI", 12))
-        self.delay_entry.pack(side="left", padx=(4, 14))
+        self.delay_entry = ctk.CTkEntry(crawl_row, width=48, textvariable=self.delay_var, font=("Microsoft YaHei UI", 12))
+        self.delay_entry.pack(side="left", padx=(4, 12))
+
+        ctk.CTkLabel(crawl_row, text="图片字号", font=("Microsoft YaHei UI", 12)).pack(side="left")
+        self.font_size_menu = ctk.CTkOptionMenu(
+            crawl_row,
+            values=list(FONT_SIZE_CHOICES.keys()),
+            variable=self.font_size_var,
+            width=142,
+            font=("Microsoft YaHei UI", 12),
+        )
+        self.font_size_menu.pack(side="left", padx=(4, 12))
 
         self.no_prompt_chk = ctk.CTkCheckBox(
-            crawl_row, text="已有登录态，跳过登录确认", variable=self.no_prompt_var,
+            crawl_row, text="跳过登录确认", variable=self.no_prompt_var,
             font=("Microsoft YaHei UI", 12), command=self._update_controls
         )
-        self.no_prompt_chk.pack(side="left", padx=(0, 12))
+        self.no_prompt_chk.pack(side="left", padx=(0, 10))
 
         self.headless_chk = ctk.CTkCheckBox(
-            crawl_row, text="后台无头运行", variable=self.headless_var, font=("Microsoft YaHei UI", 12)
+            crawl_row, text="后台无头", variable=self.headless_var, font=("Microsoft YaHei UI", 12)
         )
         self.headless_chk.pack(side="left")
+
+        ocr_row = ctk.CTkFrame(opt_frame, fg_color="transparent")
+        ocr_row.grid(row=2, column=0, padx=10, pady=(2, 10), sticky="ew")
+
+        ctk.CTkLabel(ocr_row, text="OCR 设置：", font=("Microsoft YaHei UI", 13, "bold")).pack(side="left", padx=(2, 8))
+        ctk.CTkLabel(ocr_row, text="识别精度", font=("Microsoft YaHei UI", 12)).pack(side="left")
+        self.ocr_mode_menu = ctk.CTkOptionMenu(
+            ocr_row,
+            values=list(OCR_MODE_CHOICES.keys()),
+            variable=self.ocr_mode_var,
+            width=195,
+            font=("Microsoft YaHei UI", 12),
+        )
+        self.ocr_mode_menu.pack(side="left", padx=(4, 14))
+
+        self.force_redownload_chk = ctk.CTkCheckBox(
+            ocr_row, text="强制重下图片章（调大字号后勾选）", variable=self.force_redownload_var,
+            font=("Microsoft YaHei UI", 12)
+        )
+        self.force_redownload_chk.pack(side="left", padx=(0, 12))
+
+        self.re_ocr_chk = ctk.CTkCheckBox(
+            ocr_row, text="强制重新 OCR", variable=self.re_ocr_var, font=("Microsoft YaHei UI", 12)
+        )
+        self.re_ocr_chk.pack(side="left")
 
         # 4. Action buttons
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -276,9 +356,18 @@ class CiweimaoApp(ctk.CTk):
         self.log_box.grid(row=4, column=0, padx=16, pady=(4, 14), sticky="nsew")
         self.log_box.configure(state="disabled")
 
+    def _on_mode_change(self):
+        if self.mode_var.get() == "epub_only":
+            self.font_size_var.set("不修改（原设置）")
+        elif self.mode_var.get() in ("txt_only", "both") and self.font_size_var.get() == "不修改（原设置）":
+            self.font_size_var.set("28px（推荐 OCR）")
+        self._update_controls()
+
     def _update_controls(self):
         running = self.process is not None and self.process.poll() is None
-        offline = self.mode_var.get() == "offline_ocr"
+        mode = self.mode_var.get()
+        offline = mode == "offline_ocr"
+        uses_ocr = mode in ("txt_only", "both", "offline_ocr")
         custom_range = self.range_var.get() == "custom"
 
         range_state = "normal" if (custom_range and not running) else "disabled"
@@ -288,11 +377,17 @@ class CiweimaoApp(ctk.CTk):
         crawl_state = "normal" if (not offline and not running) else "disabled"
         self.workers_menu.configure(state=crawl_state)
         self.delay_entry.configure(state=crawl_state)
+        self.font_size_menu.configure(state=crawl_state)
         self.no_prompt_chk.configure(state=crawl_state)
+        self.force_redownload_chk.configure(state=crawl_state)
         if not self.no_prompt_var.get():
             self.headless_var.set(False)
         headless_state = "normal" if (not offline and not running and self.no_prompt_var.get()) else "disabled"
         self.headless_chk.configure(state=headless_state)
+
+        ocr_state = "normal" if (uses_ocr and not running) else "disabled"
+        self.ocr_mode_menu.configure(state=ocr_state)
+        self.re_ocr_chk.configure(state=ocr_state)
 
         self.start_btn.configure(state="disabled" if running else "normal")
         self.stop_btn.configure(state="normal" if running else "disabled")
@@ -310,18 +405,29 @@ class CiweimaoApp(ctk.CTk):
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
 
-    def _open_output(self):
-        target_dir = OUTPUT_ROOT
+    def _resolve_book_folder(self):
         raw = self.url_entry.get().strip()
         try:
-            if raw.isdigit() and (OUTPUT_ROOT / raw).exists():
-                target_dir = OUTPUT_ROOT / raw
-            elif raw.startswith("http"):
-                bid = book_id(raw)
-                if (OUTPUT_ROOT / bid).exists():
-                    target_dir = OUTPUT_ROOT / bid
+            if raw.isdigit():
+                return OUTPUT_ROOT / raw
+            if raw.startswith("http"):
+                return OUTPUT_ROOT / book_id(raw)
         except ContentError:
             pass
+        return None
+
+    def _edit_replacements(self):
+        book_folder = self._resolve_book_folder()
+        if book_folder is None:
+            self._append_log("[提示] 请先输入书籍 ID 或书籍链接，再打开该书的纠错词表。\n")
+            return
+        path = ensure_book_replacements_file(book_folder)
+        self._append_log(f"[纠错词表] 已打开：{path}\n")
+        os.startfile(str(path))
+
+    def _open_output(self):
+        book_folder = self._resolve_book_folder()
+        target_dir = book_folder if (book_folder and book_folder.exists()) else OUTPUT_ROOT
         target_dir.mkdir(parents=True, exist_ok=True)
         os.startfile(str(target_dir))
 
@@ -340,6 +446,10 @@ class CiweimaoApp(ctk.CTk):
                 delay=self.delay_var.get(),
                 no_prompt=self.no_prompt_var.get(),
                 headless=self.headless_var.get(),
+                font_size=FONT_SIZE_CHOICES.get(self.font_size_var.get(), 0),
+                ocr_mode=OCR_MODE_CHOICES.get(self.ocr_mode_var.get(), "accurate"),
+                force_redownload_images=self.force_redownload_var.get(),
+                re_ocr=self.re_ocr_var.get(),
             )
         except ContentError as error:
             self._append_log(f"[参数错误] {error}\n")

@@ -8,7 +8,7 @@ import sys
 
 from playwright.async_api import async_playwright
 
-from browser import ChapterReader, SessionExpired, block_purchase, discover, logged_in
+from browser import ChapterReader, SessionExpired, apply_reader_font_size, block_purchase, discover, logged_in, normalize_font_size
 from exporter import ContentError, book_id, cached_chapter, export_epub, export_txt, save_chapter, write_json
 
 
@@ -29,20 +29,31 @@ def arguments():
     parser.add_argument('--headless', action='store_true', help='已有登录状态时在后台运行（需配合 --no-prompt）')
     parser.add_argument('--txt', action='store_true', help='同时导出 TXT（图片章节自动本地 OCR 识别）')
     parser.add_argument('--txt-only', action='store_true', help='仅导出 TXT，不生成 EPUB')
+    parser.add_argument('--font-size', type=int, default=0, help='抓取图片章节时临时调大的阅读字号（12-48 偶数，如 28；0 为不修改）')
+    parser.add_argument('--force-redownload-images', action='store_true', help='仅对已缓存的图片章节强制重新抓取（适合调大字号后重抓）')
+    parser.add_argument('--ocr-mode', choices=('accurate', 'fast'), default='accurate', help='OCR 精度档位（默认 accurate=PP-OCRv5 Server）')
+    parser.add_argument('--re-ocr', action='store_true', help='忽略已有 OCR 缓存，强制重新识别图片章节')
+    parser.add_argument('--replacements', type=Path, help='额外指定的纠错词表 JSON 路径')
     args = parser.parse_args()
     if args.delay < 1 or args.start < 1 or (args.limit is not None and args.limit < 1):
         parser.error('delay 至少为 1；start 和 limit 必须为正整数。')
+    if args.font_size:
+        try:
+            args.font_size = normalize_font_size(args.font_size)
+        except ContentError as error:
+            parser.error(str(error))
     if args.headless and not args.no_prompt:
         parser.error('--headless 必须配合 --no-prompt。')
     return args
 
 
-async def download(context, chapters, book, folder, workers=2, delay=2):
+async def download(context, chapters, book, folder, workers=2, delay=2, force_redownload_images=False):
     pending = asyncio.Queue()
     failures = {}
     stop = asyncio.Event()
     for chapter in chapters:
-        if cached_chapter(folder, chapter['id']):
+        cached = cached_chapter(folder, chapter['id'])
+        if cached and not (force_redownload_images and cached['kind'] == 'image'):
             print(f'已缓存：{chapter["title"]}', flush=True)
         else:
             pending.put_nowait(chapter)
@@ -129,26 +140,30 @@ async def run(args):
                 output = output / f'range-{args.start}-{args.start + len(chapters) - 1}'
             write_json(folder.parent / 'catalog.json', dict(book=book, chapters=all_chapters))
             print(f'《{book["title"]}》：目录共 {len(all_chapters)} 章，本次 {len(chapters)} 章。', flush=True)
-            failures = await download(context, chapters, book, folder, args.workers, args.delay)
+            if args.font_size:
+                print(f'已临时将图片抓取字号设为 {args.font_size}px（完成后自动恢复原设置）。', flush=True)
+            async with apply_reader_font_size(context, args.font_size):
+                failures = await download(
+                    context, chapters, book, folder, args.workers, args.delay,
+                    force_redownload_images=args.force_redownload_images,
+                )
             write_json(output / 'failures.json', failures)
             missing = 0
             if not args.txt_only:
                 path, missing = export_epub(book, chapters, folder, output, failures)
                 print(f'EPUB：{path}\n成功 {len(chapters) - missing} 章；缺失 {missing} 章。', flush=True)
             if args.txt or args.txt_only:
-                from ocr import cached_ocr, chapter_paragraphs, get_engine
-                engine = None
+                from ocr import make_ocr_runner
+                from proofread import apply_proofread, load_replacements
 
-                def ocr_fn(ch_folder, record):
-                    nonlocal engine
-                    if record['kind'] == 'image' and cached_ocr(ch_folder, record['id'], record['sha256']) is None:
-                        if engine is None:
-                            print('正在初始化本地 OCR 引擎（RapidOCR）...', flush=True)
-                            engine = get_engine()
-                        print(f'正在 OCR 识别：{record["title"]}', flush=True)
-                    return chapter_paragraphs(ch_folder, record, engine=engine)
-
-                txt_path, txt_missing = export_txt(book, chapters, folder, output, failures, ocr_fn=ocr_fn)
+                replacements = load_replacements(folder.parent, args.replacements)
+                if replacements:
+                    print(f'已加载纠错词表：{len(replacements)} 条替换规则。', flush=True)
+                ocr_fn = make_ocr_runner(mode=args.ocr_mode, force=args.re_ocr)
+                proofread_fn = lambda paras: apply_proofread(paras, replacements=replacements, normalize_punct=True)
+                txt_path, txt_missing = export_txt(
+                    book, chapters, folder, output, failures, ocr_fn=ocr_fn, proofread_fn=proofread_fn,
+                )
                 missing = max(missing, txt_missing)
                 print(f'TXT：{txt_path}\n成功 {len(chapters) - txt_missing} 章；缺失 {txt_missing} 章。', flush=True)
             if missing:

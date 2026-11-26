@@ -11,11 +11,12 @@ from zipfile import ZipFile, ZIP_STORED
 from PIL import Image
 from playwright.async_api import async_playwright
 
-from browser import ChapterReader, SessionExpired, discover
+from browser import ChapterReader, SessionExpired, build_theme_cookie, discover, normalize_font_size
 from exporter import ContentError, book_id, cached_chapter, export_epub, export_txt, save_chapter, validate_image
 from gui import build_command, normalize_target, parse_chapter_range
 from main import download
 from ocr import cached_ocr, merge_lines_to_paragraphs, preprocess_image, save_ocr, split_into_chunks
+from proofread import apply_proofread, ensure_book_replacements_file, load_replacements
 
 
 def picture(width=800, height=3200):
@@ -157,16 +158,56 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(parse_chapter_range(False, '20', ''), (20, None))
         with self.assertRaises(ContentError):
             parse_chapter_range(False, '15', '10')
-        cmd = build_command('python', '100363224', 'txt_only', False, '5', '8', workers=1, delay=2, no_prompt=True, headless=True)
+        cmd = build_command(
+            'python', '100363224', 'txt_only', False, '5', '8',
+            workers=1, delay=2, no_prompt=True, headless=True,
+            font_size=28, ocr_mode='accurate', force_redownload_images=True, re_ocr=True,
+        )
         self.assertIn('--txt-only', cmd)
+        self.assertIn('--font-size', cmd)
+        self.assertEqual(cmd[cmd.index('--font-size') + 1], '28')
+        self.assertIn('--force-redownload-images', cmd)
+        self.assertIn('--ocr-mode', cmd)
+        self.assertEqual(cmd[cmd.index('--ocr-mode') + 1], 'accurate')
+        self.assertIn('--re-ocr', cmd)
         self.assertIn('--start', cmd)
         self.assertEqual(cmd[cmd.index('--start') + 1], '5')
         self.assertEqual(cmd[cmd.index('--limit') + 1], '4')
         self.assertIn('--headless', cmd)
-        offline_cmd = build_command('python', 'https://www.ciweimao.com/book/100363224', 'offline_ocr', False, '117', '117')
+        offline_cmd = build_command(
+            'python', 'https://www.ciweimao.com/book/100363224', 'offline_ocr', False, '117', '117',
+            ocr_mode='fast', re_ocr=True,
+        )
         self.assertTrue(offline_cmd[1].endswith('ocr.py'))
         self.assertEqual(offline_cmd[2], '100363224')
+        self.assertEqual(offline_cmd[offline_cmd.index('--ocr-mode') + 1], 'fast')
+        self.assertIn('--re-ocr', offline_cmd)
         self.assertEqual(offline_cmd[offline_cmd.index('--limit') + 1], '1')
+
+    def test_font_size_cookie_and_ocr_cache_engine_tag(self):
+        self.assertEqual(normalize_font_size(0), 0)
+        self.assertEqual(normalize_font_size(28), 28)
+        self.assertEqual(normalize_font_size(29), 28)
+        with self.assertRaises(ContentError):
+            normalize_font_size(60)
+        self.assertEqual(build_theme_cookie(None, 28), 'default,0,28,0,0,0')
+        self.assertEqual(build_theme_cookie('green,2,14,1,1,0', 32), 'green,2,32,1,1,0')
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            save_ocr(folder, '10', 'sha1', ['段落A'], engine_tag='ppocrv5_server_v2')
+            self.assertEqual(cached_ocr(folder, '10', 'sha1', engine_tag='ppocrv5_server_v2'), ['段落A'])
+            self.assertIsNone(cached_ocr(folder, '10', 'sha1', engine_tag='ppocrv5_mobile_v2'))
+
+    def test_proofread_replacements_and_punctuation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            book_dir = Path(directory)
+            path = ensure_book_replacements_file(book_dir)
+            self.assertTrue(path.exists())
+            path.write_text(json.dumps({'营缪乐': '蕾缪乐', '营': '错', '育练': '宵练'}, ensure_ascii=False), encoding='utf-8')
+            mapping = load_replacements(book_dir)
+            self.assertEqual(mapping['营缪乐'], '蕾缪乐')
+            cleaned = apply_proofread(['营缪乐拿出了育练...还有3.14。', '...真的吗？'], replacements=mapping)
+            self.assertEqual(cleaned, ['蕾缪乐拿出了宵练……还有3.14。', '……真的吗？'])
 
 
 class BrowserTests(unittest.IsolatedAsyncioTestCase):

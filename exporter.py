@@ -157,7 +157,7 @@ def export_epub(book, chapters, folder, output, failures=None):
     return destination, missing
 
 
-def export_txt(book, chapters, folder, output, failures=None, ocr_fn=None):
+def export_txt(book, chapters, folder, output, failures=None, ocr_fn=None, proofread_fn=None):
     """Export chapters to UTF-8 TXT; run ocr_fn for image chapters and mark missing ones."""
     failures = failures or {}
     records = [cached_chapter(folder, c["id"]) for c in chapters]
@@ -187,6 +187,8 @@ def export_txt(book, chapters, folder, output, failures=None, ocr_fn=None):
         elif ocr_fn is not None:
             try:
                 paragraphs = ocr_fn(folder, record)
+                if paragraphs and proofread_fn is not None:
+                    paragraphs = proofread_fn(paragraphs)
             except ContentError as error:
                 missing += 1
                 lines.append(f"【OCR 失败】{error}")
