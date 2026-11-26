@@ -1,0 +1,4 @@
+playwright>=1.40,<2
+Pillow>=10,<13
+rapidocr-onnxruntime>=1.4,<2
+customtkinter>=5,<6
